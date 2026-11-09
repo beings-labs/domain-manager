@@ -1,0 +1,5 @@
+# Bundle patch layer: insert this package's host half.
+# `dsh.bundle.patch` points here, so `dsh plugin add` picks it up.
+- insert:
+    - id: dsh-domain-manager
+      name: '@beings-labs/dsh-domain-manager'

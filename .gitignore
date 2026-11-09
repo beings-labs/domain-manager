@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+*.tgz
+dist/
+
+# Local portfolio data / dev scratch — never commit real domains
+dev/domains.json
+dev/*.local.json
+*.local.json
+.dsh-*/

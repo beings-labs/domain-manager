@@ -1,0 +1,61 @@
+{
+  "name": "@beings-labs/dsh-domain-manager",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Manage a domain portfolio in DeepSeek Harness: sync registrations from Namecheap and Cloudflare, track expiry dates, auto-renewal and yearly renewal costs, and check domain availability.",
+  "license": "MIT",
+  "author": {
+    "name": "beingsone",
+    "email": "one@beings.dev",
+    "url": "https://github.com/beingsone"
+  },
+  "type": "module",
+  "main": "index.js",
+  "icon": "icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "domains",
+    "domain-portfolio",
+    "namecheap",
+    "cloudflare",
+    "registrar",
+    "availability"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beings-labs/domain-manager.git"
+  },
+  "homepage": "https://github.com/beings-labs/domain-manager#readme",
+  "files": [
+    "index.js",
+    "lib/",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4 || >=4.0.6-alpha.2 <5.0.0",
+    "@deepseek-ai/dsh": ">=0.2.0 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 || >=0.2.1-rc.2 || >=0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2 || >=3.18.6-alpha.2 <4.0.0"
+  },
+  "scripts": {
+    "test": "node --import ./test/register-stubs.js --test test/*.test.js"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

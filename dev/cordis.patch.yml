@@ -1,0 +1,13 @@
+# Dev overlay: load this checkout without installing it.
+# Replace /absolute/path/to/domain-manager with the real path of your clone.
+- insert:
+    - id: dsh-domain-manager
+      name: '/absolute/path/to/domain-manager/index.js'
+      config:
+        # Local scratch store; git-ignored so portfolio data never lands in git.
+        dataFile: '/absolute/path/to/domain-manager/dev/domains.json'
+        # The dev probe (dev/probe.patch.yml) registers fake Namecheap MCP tools, so
+        # force MCP for the probe even when auto would prefer configured API credentials.
+        providers:
+          namecheap: mcp
+          cloudflare: api
