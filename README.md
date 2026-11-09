@@ -204,6 +204,49 @@ dsh --profile <profile> --patch /absolute/path/to/dsh-domain-manager/dev/cordis.
 
 Portfolio data never belongs in this repository: the store defaults to `$DSH_HOME/dsh-domain-manager/domains.json`, and the dev scratch file `dev/domains.json` is git-ignored.
 
+## Publishing to npm
+
+The [Publish to npm workflow](.github/workflows/publish.yml) publishes the public package `@beings-labs/dsh-domain-manager`. It accepts stable `vX.Y.Z` tags only, requires the tag to match `package.json`, runs the tests and checks the package contents before publishing the exact validated commit. There is no dependency-install step: the tests use the host-package stubs described above.
+
+### First publication
+
+The existing `v0.1.0` tag predates this workflow, so publishing it requires a manual bootstrap:
+
+1. Ensure your npm account can publish packages under the `beings-labs` scope.
+2. Create a short-lived [granular npm access token](https://docs.npmjs.com/creating-and-viewing-access-tokens/) with **Read and write (publish and stage)** access to the `beings-labs` package scope and **Bypass two-factor authentication** enabled for unattended publishing. Organization-management permissions alone do not grant package-publishing access.
+3. Add it as the repository's **Actions secret** named `NPM_TOKEN`. Never put the token in source files or release notes.
+4. Run **Publish to npm** from the `main` branch with the `tag` input set to `v0.1.0`:
+
+   ```sh
+   gh workflow run publish.yml --repo beings-labs/dsh-domain-manager --ref main -f tag=v0.1.0
+   ```
+
+The bootstrap publishes the contents of the existing tag, not the current branch. It deliberately omits provenance because a manual run from `main` has a different workflow source commit from the release tag. It has no OIDC permission and receives the npm token only in the publish step.
+
+### Subsequent releases: trusted publishing
+
+After the first publication, configure a [trusted publisher](https://docs.npmjs.com/trusted-publishers/) in the npm package's settings:
+
+| Setting | Value |
+|---|---|
+| Provider | GitHub Actions |
+| Organization or user | `beings-labs` |
+| Repository | `dsh-domain-manager` |
+| Workflow filename | `publish.yml` |
+| Environment name | Leave empty |
+| Allowed actions | Enable direct publishing with `npm publish` |
+
+Remove the `NPM_TOKEN` Actions secret and revoke its npm token after bootstrapping. Future tag-push runs use OIDC, not the bootstrap token, and publish with provenance. Restrict token publishing in the npm package settings once trusted publishing is configured. npm requires a newly configured trusted publisher to complete its first successful publish within two days; configure it close to the next release.
+
+For each subsequent release, update `package.json`, commit and push the version change, then create and push a matching annotated tag:
+
+```sh
+git tag -a v0.1.1 -m "Release v0.1.1"
+git push origin v0.1.1
+```
+
+The tag push triggers publication automatically. Published npm versions and release tags are immutable; do not move `v0.1.0` to include this workflow or try to republish an existing npm version.
+
 ## License
 
 MIT © Beings Labs

@@ -1,0 +1,129 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to bootstrap on npm (for example, v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Validate tag and package metadata
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { execFileSync } from 'node:child_process'
+          import { appendFileSync, readFileSync } from 'node:fs'
+
+          const tag = process.env.RELEASE_TAG
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+          assert.match(tag, /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/, 'Only stable vX.Y.Z release tags can be published.')
+          assert.equal(pkg.name, '@beings-labs/dsh-domain-manager', 'Unexpected npm package or organization.')
+          assert.equal(tag, `v${pkg.version}`, 'Release tag must match package.json version.')
+          assert.equal(pkg.repository.url, 'git+https://github.com/beings-labs/dsh-domain-manager.git', 'Unexpected package repository.')
+          assert.equal(pkg.publishConfig.access, 'public', 'The scoped package must be public.')
+          if (process.env.EVENT_NAME === 'workflow_dispatch') {
+            assert.equal(process.env.WORKFLOW_REF, 'refs/heads/main', 'Run the bootstrap workflow from main.')
+          }
+
+          const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+          appendFileSync(process.env.GITHUB_OUTPUT, `commit=${commit}\n`)
+          console.log(`Validated ${pkg.name}@${pkg.version} at ${commit}`)
+          NODE
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check package contents
+        run: npm pack --dry-run
+
+  bootstrap:
+    name: Bootstrap first npm publication
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Publish initial package with token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::Add an NPM_TOKEN Actions secret with publish access to the beings-labs npm scope before bootstrapping."
+            exit 1
+          fi
+          npm publish --access public --provenance=false
+
+  publish:
+    name: Publish release with trusted publishing
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Publish to beings-labs with provenance
+        run: npm publish --access public --provenance
