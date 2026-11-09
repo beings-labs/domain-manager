@@ -28,9 +28,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/beings-labs/domain-manager.git"
+    "url": "git+https://github.com/beings-labs/dsh-domain-manager.git"
   },
-  "homepage": "https://github.com/beings-labs/domain-manager#readme",
+  "homepage": "https://github.com/beings-labs/dsh-domain-manager#readme",
   "files": [
     "index.js",
     "lib/",

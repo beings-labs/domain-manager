@@ -1,6 +1,6 @@
 # Dev overlay: loads dev/probe.js, which logs the registered tool schemas and
 # dispatches a real domain_manager_report call at startup (verifies registration in a host).
-# Replace /absolute/path/to/domain-manager with the real path of your clone.
+# Replace /absolute/path/to/dsh-domain-manager with the real path of your clone.
 - insert:
     - id: domains-probe
-      name: '/absolute/path/to/domain-manager/dev/probe.js'
+      name: '/absolute/path/to/dsh-domain-manager/dev/probe.js'

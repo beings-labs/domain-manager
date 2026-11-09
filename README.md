@@ -28,13 +28,13 @@ dsh plugin --profile <profile> add @beings-labs/dsh-domain-manager
 Or straight from GitHub:
 
 ```sh
-dsh plugin --profile <profile> add github:beings-labs/domain-manager
+dsh plugin --profile <profile> add github:beings-labs/dsh-domain-manager
 ```
 
 From a local checkout:
 
 ```sh
-dsh plugin --profile <profile> add /path/to/domain-manager
+dsh plugin --profile <profile> add /path/to/dsh-domain-manager
 ```
 
 Restart the Harness app, then check the layer loaded:
@@ -196,8 +196,8 @@ Tests cover the store, markdown round-trips, XML parsing, both registrar clients
 Load the checkout without installing it into a profile:
 
 ```sh
-# edit dev/cordis.patch.yml first: replace /absolute/path/to/domain-manager with your clone path
-dsh --profile <profile> --patch /absolute/path/to/domain-manager/dev/cordis.patch.yml
+# edit dev/cordis.patch.yml first: replace /absolute/path/to/dsh-domain-manager with your clone path
+dsh --profile <profile> --patch /absolute/path/to/dsh-domain-manager/dev/cordis.patch.yml
 ```
 
 `dev/probe.patch.yml` additionally loads a startup probe that logs the registered tool schemas and dispatches a real `domain_manager_report` call — used to verify registration in a real host.
