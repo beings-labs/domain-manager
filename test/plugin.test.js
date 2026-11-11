@@ -41,7 +41,8 @@ test('registers the full tool set without any personal data', async () => {
   assert.deepEqual([...tools.keys()].sort(), [
     'domain_manager_add', 'domain_manager_check_availability', 'domain_manager_export_markdown',
     'domain_manager_import_markdown', 'domain_manager_list', 'domain_manager_remove', 'domain_manager_report',
-    'domain_manager_search', 'domain_manager_sync', 'domain_manager_update',
+    'domain_manager_search', 'domain_manager_sync', 'domain_manager_transfer_check', 'domain_manager_transfer_start',
+    'domain_manager_transfer_status', 'domain_manager_update',
   ])
   assert.ok(logs.some((line) => line.includes('dsh-domain-manager ready')))
   assert.ok(logs.some((line) => line.includes('namecheap: auto mode') && line.includes('cloudflare: auto mode')))

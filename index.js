@@ -13,7 +13,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 
 import {
-  addDomain, daysLeft, emptyData, loadData, normalizeName, removeDomain, round2, saveData,
+  addDomain, daysLeft, emptyData, isTransferActive, loadData, normalizeName, removeDomain, round2, saveData,
   summarize, updateDomain, upsertDomain, writeFileAtomic,
 } from './lib/store.js'
 import { parseDomainsMarkdown, renderDomainsMarkdown } from './lib/markdown.js'
@@ -22,6 +22,7 @@ import * as namecheap from './lib/registrars/namecheap.js'
 import * as cloudflare from './lib/registrars/cloudflare.js'
 import * as namecheapMcp from './lib/providers/mcp.js'
 import { checkAvailability, checkViaRdap } from './lib/availability.js'
+import { registerTransferTools, transferSchema, transferStateLabel } from './lib/transfers.js'
 
 export const name = 'dsh-domain-manager'
 export const inject = ['tools']
@@ -143,6 +144,7 @@ const domainSchema = {
     notes: { type: 'string' },
     daysLeft: { type: 'number' },
     daysSinceSync: { type: 'number' },
+    transfer: transferSchema,
   },
 }
 
@@ -238,6 +240,7 @@ function toRow(domain) {
   if (domain.notes) out.notes = domain.notes
   if (typeof domain.daysLeft === 'number') out.daysLeft = domain.daysLeft
   if (typeof domain.daysSinceSync === 'number') out.daysSinceSync = domain.daysSinceSync
+  if (domain.transfer) out.transfer = domain.transfer
   return out
 }
 
@@ -343,6 +346,7 @@ export async function apply(ctx, config) {
   const dueWithinDays = config.dueWithinDays ?? 90
   const staleAfterDays = config.staleAfterDays ?? 14
   const providerPreferences = resolveProviderPreferences(config.providers ?? {})
+  registerTransferTools(ctx, { dataFile, withStore, cloudflareConfig: credentials.cloudflare })
 
   /**
    * Which transport reaches Namecheap: api (API key — preferred in auto and the only
@@ -464,7 +468,8 @@ export async function apply(ctx, config) {
         const rows = value.domains.map((domain) => {
           const due = typeof domain.daysLeft === 'number' ? `, ${domain.daysLeft}d` : ''
           const fee = typeof domain.icannFee === 'number' ? ` + ${money(domain.icannFee)} ICANN` : ''
-          return `| ${domain.name} | ${domain.registrar} | ${domain.expires}${due} | auto-renew ${domain.autoRenew ? 'yes' : 'no'} | ${money(domain.renewalPrice)}/year${fee} |`
+          const transfer = domain.transfer ? ` (transfer to ${domain.transfer.to}: ${transferStateLabel(domain.transfer)})` : ''
+          return `| ${domain.name} | ${domain.registrar}${transfer} | ${domain.expires}${due} | auto-renew ${domain.autoRenew ? 'yes' : 'no'} | ${money(domain.renewalPrice)}/year${fee} |`
         })
         const fees = round2(value.domains.reduce((total, domain) => total + (domain.icannFee ?? 0), 0))
         return text(
@@ -592,6 +597,8 @@ export async function apply(ctx, config) {
         return await withStore(async () => {
           const data = await loadData(dataFile)
           const { name: domainName, ...patch } = args
+          const existing = data.domains.find((domain) => domain.name === normalizeName(domainName))
+          if (patch.registrar && isTransferActive(existing?.transfer)) throw new Error('Cannot change registrar during a transfer; use domain_manager_transfer_status')
           if (patch.promoPrice === 0) patch.promoPrice = null
           const next = updateDomain(data, domainName, patch)
           await saveData(dataFile, next)
@@ -617,6 +624,9 @@ export async function apply(ctx, config) {
       try {
         return await withStore(async () => {
           const data = await loadData(dataFile)
+          if (isTransferActive(data.domains.find((domain) => domain.name === normalizeName(args.name))?.transfer)) {
+            throw new Error('Cannot remove a domain with an active or unknown transfer; check domain_manager_transfer_status first')
+          }
           const next = removeDomain(data, args.name)
           await saveData(dataFile, next)
           return { ok: true, name: normalizeName(args.name), ...totalsOf(next) }
@@ -686,16 +696,31 @@ export async function apply(ctx, config) {
           let added = 0
           let updated = 0
           let unchanged = 0
+          const transferWarnings = []
           const seen = new Set()
+          const seenByRegistrar = new Set()
           for (const row of fetched) {
+            const registrarKey = `${row.registrar}:${row.name}`
+            if (seenByRegistrar.has(registrarKey)) throw new Error(`registrar sync returned a duplicate domain: ${row.name}`)
+            seenByRegistrar.add(registrarKey)
+            const existing = data.domains.find((domain) => domain.name === row.name)
+            const transfer = existing?.transfer
+            if (
+              (isTransferActive(transfer) && row.registrar === transfer.to) ||
+              (transfer?.state === 'succeeded' && row.registrar === transfer.from)
+            ) {
+              unchanged += 1
+              transferWarnings.push(`${row.name}: ignored ${row.registrar} facts to avoid changing registrar before verified transfer completion or reverting a completed transfer; use domain_manager_transfer_status`)
+              continue
+            }
             if (seen.has(row.name)) throw new Error(`registrar sync returned a duplicate domain: ${row.name}`)
             seen.add(row.name)
-            const existing = data.domains.find((domain) => domain.name === row.name)
+            const changingRegistrar = existing && existing.registrar !== row.registrar
             const merged = {
               ...row,
-              renewalPrice: row.renewalPrice ?? existing?.renewalPrice ?? null,
-              promoPrice: Object.hasOwn(row, 'promoPrice') ? row.promoPrice : (existing?.promoPrice ?? null),
-              icannFee: Object.hasOwn(row, 'icannFee') ? row.icannFee : (existing?.icannFee ?? null),
+              renewalPrice: row.renewalPrice ?? (changingRegistrar ? null : existing?.renewalPrice) ?? null,
+              promoPrice: Object.hasOwn(row, 'promoPrice') ? row.promoPrice : (changingRegistrar ? null : existing?.promoPrice ?? null),
+              icannFee: Object.hasOwn(row, 'icannFee') ? row.icannFee : (changingRegistrar ? null : existing?.icannFee ?? null),
               currency: row.currency ?? existing?.currency ?? config.currency ?? 'USD',
               source: row.registrar.toLowerCase(),
               syncedAt: now,
@@ -719,7 +744,7 @@ export async function apply(ctx, config) {
             .map((domain) => domain.name)
           // A registrar integration that answers with zero rows must not look like a
           // clean sync: without this, a broken adapter silently skips every domain.
-          const warnings = [...fetchWarnings]
+          const warnings = [...fetchWarnings, ...transferWarnings]
           for (const provider of providers) {
             if ((fetchedCount.get(provider) ?? 0) > 0) continue
             const stored = data.domains.filter((domain) => domain.registrar.toLowerCase() === provider)
@@ -921,14 +946,21 @@ export async function apply(ctx, config) {
         const parsed = parseDomainsMarkdown(markdown)
         if (parsed.domains.length === 0) throw new Error(`no portfolio tables found in ${args.path}`)
         return await withStore(async () => {
-          const current = args.replace ? emptyData() : await loadData(dataFile)
+          const stored = await loadData(dataFile)
+          if (args.replace && stored.domains.some((domain) => isTransferActive(domain.transfer))) {
+            throw new Error('Cannot replace the portfolio while transfers are active or unknown; check domain_manager_transfer_status first')
+          }
+          const current = args.replace ? emptyData() : stored
           let next = current
           let added = 0
           let updated = 0
           for (const domain of parsed.domains) {
-            const exists = next.domains.some((entry) => entry.name === domain.name)
+            const existing = next.domains.find((entry) => entry.name === domain.name)
+            if (isTransferActive(existing?.transfer) && existing.registrar.toLowerCase() !== domain.registrar.toLowerCase()) {
+              throw new Error(`Cannot change registrar for ${domain.name} during a transfer; use domain_manager_transfer_status`)
+            }
             next = upsertDomain(next, domain)
-            if (exists) updated += 1
+            if (existing) updated += 1
             else added += 1
           }
           const saved = await saveData(dataFile, next)

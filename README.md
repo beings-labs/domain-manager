@@ -13,9 +13,10 @@ No bundled portfolio and no credentials — install it, point it at your registr
 - **Browser login instead of API keys (Namecheap, opt-in)** — set `providers.namecheap: mcp` to reach Namecheap through its official MCP server after a one-time browser sign-in, with no API key or IP allow-listing. MCP mode cannot get price information for the domains you already own (domain list + availability only), so it is an alternative to the default, not a replacement for it. See [Namecheap without API keys](#namecheap-without-api-keys-browser-login).
 - **Availability checks** — 1–20 domains per call. Uses Cloudflare's registry-accurate `domain-check`, Namecheap's `domains.check`, or the Namecheap MCP tool when `provider` is `mcp`, and otherwise asks public **RDAP** with no credentials at all. RDAP is registry-first: the domain's own RDAP service is discovered from the IANA bootstrap, with `rdap.org` kept only as a fallback so a rate-limited redirector cannot break lookups.
 - **Domain search** — candidate discovery through the Cloudflare Registrar search API.
+- **Registrar transfers** — API-assisted **Namecheap → Cloudflare** transfers: eligibility and fee checks, explicit confirmation before paid submission, and persistent progress tracking. DNS migration, unlocking and authorization-code retrieval stay manual.
 - **Markdown interop** — import a portfolio from a markdown table and export the portfolio back to a grouped-by-registrar document.
 
-The plugin is read-only towards registrars: it never registers, transfers or renews anything.
+Registrar sync, availability, search and transfer checks are read-only. Only `domain_manager_transfer_start` submits a registrar change and can incur a non-refundable transfer charge; it requires explicit confirmation of a checked quote. The plugin never registers new domains, manually renews registrations or changes DNS.
 
 ## Install
 
@@ -88,6 +89,8 @@ Environment variables are used when the matching config field is absent:
 
 **Cloudflare** — Cloudflare is API-only; the default `auto` mode is an alias for `api`. Create an API token at <https://dash.cloudflare.com/profile/api-tokens>. Listing your registered domains needs *Registrar* read permission; the availability/search endpoints are part of the Registrar API beta and need Registrar write permission. The same endpoints back the Cloudflare MCP servers, so an agent workflow you already use through MCP sees identical data.
 
+Transfers also require Registrar write access and access to the Registrar API beta. Set up a default payment method, default registrant contact and the registration agreement in the Cloudflare dashboard before submission. No Namecheap API credentials are required for transfers; the source domain must already be in the local portfolio.
+
 **Namecheap API (preferred in auto mode, and the only path that refreshes renewal pricing)** — enable API access under *Profile → Tools → Namecheap API Access*, generate an API key, and allow-list the public IP you send as `clientIp`. Namecheap's XML API returns the registered-domain list and availability/premium pricing; for renewal prices it exposes the account's **per-TLD** rates through `namecheap.users.getPricing` (regular rate, currently charged promo price, and the per-year ICANN fee). `domain_manager_sync` uses that feed to keep `renewalPrice`, `promoPrice` and `icannFee` current. The feed is ~3 MB and is cached in-process for 6 hours. If you would rather not create API credentials, auto mode can use the MCP browser-login path below to list domains and check availability, but it cannot read prices for the domains you already own.
 
 ### Namecheap without API keys (browser login)
@@ -129,6 +132,9 @@ Notes:
 | `domain_manager_sync` | Sync from `namecheap` (auto prefers API credentials, otherwise MCP browser login) / `cloudflare` (API) or `all`; Namecheap API mode also refreshes renewal/promo/ICANN-fee prices, while MCP mode cannot read prices for registered domains; `dryRun` previews |
 | `domain_manager_check_availability` | Check 1–20 domains; `provider`: `auto`, `mcp`, `cloudflare`, `namecheap`, `rdap`; fallback warnings are included in the result |
 | `domain_manager_search` | Cloudflare domain-search candidates for a keyword |
+| `domain_manager_transfer_check` | Check a stored Namecheap domain's transfer eligibility/fees; explain blockers in plain language; save a quote (keeping the ID when nothing changed); best-effort warn when the Cloudflare zone is missing or not Active |
+| `domain_manager_transfer_start` | Submit a **paid, non-refundable** transfer after explicit user approval (`confirm: true` and the checked `quoteId`); recheck eligibility and pricing |
+| `domain_manager_transfer_status` | Refresh a submitted transfer; report the stage (awaiting approval, in progress, action required, blocked, failed, succeeded) with the next action, and update the portfolio only after verified completion |
 | `domain_manager_import_markdown` | Import portfolio tables from a markdown file (upsert or replace) |
 | `domain_manager_export_markdown` | Render the portfolio to a markdown document (`dryRun` to preview) |
 
@@ -138,6 +144,26 @@ Example prompts:
 - "Sync my Cloudflare registrations, then report the yearly cost."
 - "Is example.dev available, and what does Cloudflare charge for it?"
 - "Export my portfolio to ~/domains.md."
+- "Check moving example.com from Namecheap to Cloudflare and show me the fee and prerequisites. Don't submit it yet."
+
+## Moving from Namecheap to Cloudflare
+
+This is a registration transfer, not just a DNS-provider change. Only **Namecheap → Cloudflare** is currently supported. The workflow uses Cloudflare's [transfer eligibility](https://developers.cloudflare.com/api/resources/registrar/methods/transfer_check/), [transfer-in](https://developers.cloudflare.com/api/resources/registrar/subresources/transfer_in/methods/create/) and [transfer status](https://developers.cloudflare.com/api/resources/registrar/subresources/transfer_in_status/methods/get/) APIs.
+
+1. Sync or add the domain to the portfolio with `registrar: Namecheap`.
+2. Complete the manual [Cloudflare prerequisites](https://developers.cloudflare.com/registrar/get-started/transfer-domain-to-cloudflare/): resolve transfer locks/holds, back up and migrate **all** DNS records (including email), disable old DNSSEC/DS records and allow propagation **before** changing nameservers. Use Cloudflare's assigned nameservers and wait for an **Active** full-setup zone. Cloudflare Registrar requires Cloudflare authoritative DNS.
+3. In Namecheap **Domain List → Manage → Sharing & Transfer**, unlock the domain and request the EPP/authorization code by email. For `.uk` namespaces, omit the code and follow the IPS-tag transfer process (`CLOUDFLARE`). Recent registrations, transfers or registrant-contact changes can trigger a 60-day lock. Premium domains and extensions needing additional registry-specific contact fields may require the Cloudflare dashboard.
+4. Call `domain_manager_transfer_check` with `name` and the **raw** `authCode` (not base64). Optional `autoRenew` defaults to the current portfolio setting. The result includes a `quoteId`, transfer fee, annual renewal price, auto-renew choice and eligibility reasons such as `domain_locked`, `dnssec_enabled` or `zone_status_invalid`. Checks only read the registrar; the quote is stored locally. The result explains each eligibility reason in plain language and warns if the target account's Cloudflare zone is missing or still `pending`. This advisory lookup requires Zone read permission; permission, network and malformed-response failures appear as warnings rather than silently implying readiness. Re-running a check while eligibility, prices and auto-renew are unchanged keeps the same `quoteId` (mentioned in `message`) and refreshes the check timestamp, so a previous approval stays valid.
+5. **Before submitting, remind the user that the transfer may extend registration by one year and bill for that additional year at Cloudflare as part of the quoted transfer fee, even if auto-renew is off.** Registry rules vary, and zero-fee transfers do not incur that charge. Ready quotes return a `confirmationPrompt` containing this reminder, the domain, fee/currency, annual renewal price and auto-renew setting. **Ask that question and wait for explicit approval**; a request to check or prepare a transfer is not approval. Only then call `domain_manager_transfer_start` with `name`, the same `quoteId`, `confirm: true` and the code again. The plugin rejects missing/false confirmation and rechecks eligibility and both prices; changed results require a new check and confirmation. A successful paid transfer charges the account's default payment method and is **non-refundable**.
+6. Approve any registrar emails and call `domain_manager_transfer_status` as needed. Transfers typically take 1–10 days; Namecheap may offer expedited release. `action_required` means finish the returned action before checking again; `blocked` can require the losing registrar or registry to respond. Results use plain-language stage labels (for example `submitted, awaiting approval`) plus billing guidance and numbered next steps. Some transfers auto-release after about five days, but registry rules and holds can change that timing. Billing guidance describes the quoted fee, not an independently verified payment; check the Cloudflare dashboard for charges. Expiry extensions depend on registry rules rather than always adding one year. Failures are surfaced and never automatically retried.
+
+Read failures that are safe to retry explain themselves: a Cloudflare `401` names the credential to fix and notes that the plugin reads `CLOUDFLARE_API_TOKEN` only at startup (restart DSH after editing `~/.dsh/.env`); error `9109` points at the token's Client IP Address Filtering; and a `403` for `zone.create` points at the required Account-scoped "Zone → Edit" policy.
+
+Pending/uncertain transfers survive restarts. The plugin saves submission intent **before** the API request: on a timeout, HTTP 409 conflict or unknown outcome, check status and the Cloudflare dashboard rather than submitting again. A generic HTTP 404 does not prove that no transfer exists; reconciliation only records a missing workflow when Cloudflare explicitly reports that none was found. After a definitive rejection or confirmed missing workflow, run a new check and obtain explicit approval before retrying. Do not edit the transfer record to bypass these safeguards.
+
+Until Cloudflare reports success **and** returns an active registration, the portfolio keeps Namecheap and its existing facts. Completion refreshes expiry and auto-renew from Cloudflare, adopts the quoted Cloudflare renewal price and clears Namecheap-only promo/ICANN fees, while preserving purpose/group/notes. Run normal Cloudflare sync to refresh renewal pricing later. Active or uncertain transfers cannot be removed, overwritten by a replace import, or manually assigned another registrar; ordinary sync cannot prematurely move them or revert a completed transfer based on stale Namecheap data. Markdown export is a portfolio view, **not** a transfer-state backup; keep the JSON store to resume transfers.
+
+Authorization codes are only sent to Cloudflare over HTTPS and are **not stored** in the portfolio or returned in results; both raw and encoded codes are redacted from request errors. **The host may retain tool arguments in conversation history/logs**, so handle codes as secrets and avoid sharing them in exported conversations. The plugin does not automate DNS changes, Namecheap unlocking/code requests, contact setup or billing setup.
 
 ## Data
 
@@ -169,6 +195,8 @@ The store defaults to `$DSH_HOME/dsh-domain-manager/domains.json` (`~/.dsh` when
 
 Store writes and markdown exports are atomic (exclusive temp file + rename). New files have owner-only permissions (`0600`), newly created directories use `0700`, and temporary files are cleaned up on failure. Existing directory permissions are not changed. A corrupt file fails loudly instead of silently starting empty. The repository ships no portfolio data.
 
+Domains involved in a transfer also have an optional validated `transfer` object: source/destination, destination account ID, state, quote ID/prices/currency, auto-renew choice, timestamps, eligibility reasons, advisory zone warnings and action/failure messages. It contains no authorization code or API token. Existing version-1 stores without this field remain compatible.
+
 ## Markdown format
 
 Import accepts any table with `Domain` and `Expires` columns, plus optional `Registrar`, `Purpose`, `Group`, `Renewal Price`, `Currency`, `Auto-renew` and `Notes`. Prices may look like `$12.20/year + $0.20 ICANN` with an optional `*(promo: $9.99)*`. An unknown regular price stays unknown even when a promo or fee is present. Escaped pipes and literal asterisks in text cells are preserved. If there is no `Registrar` column, the closest `## ` heading (`## Cloudflare`, `## Namecheap`) is used. Tables without Domain/Expires columns (for example a "Domains to Acquire" list) are skipped.
@@ -182,7 +210,7 @@ Export writes one `## <Registrar>` section per registrar, explicit registrar and
 - HTTP timeouts cover the complete response, including reading the body. MCP calls have a deadline even if a tool ignores its abort signal.
 - Malformed registrar/MCP responses and duplicate sync rows fail explicitly instead of becoming successful empty or partial syncs. Namecheap refuses a partial sync if its page limit is reached. Availability responses must cover every requested domain exactly once with a boolean answer; auto checks can fall back to the next provider and report the failure in `warnings`.
 - XML DTDs and structurally malformed XML are rejected; XML traversal does not depend on JavaScript recursion depth.
-- Registrar access is read-only.
+- Registrar access is read-only except the explicitly confirmed, billable `domain_manager_transfer_start` call. Transfers never automatically change DNS or unlock the source domain.
 - `domain_manager_check_availability` only performs DNS/RDAP or registrar read calls; it cannot register or buy anything.
 
 ## Development
@@ -191,7 +219,7 @@ Export writes one `## <Registrar>` section per registrar, explicit registrar and
 npm test
 ```
 
-Tests cover the store, markdown round-trips, XML parsing, both registrar clients (mocked HTTP, no network), RDAP availability, and the plugin's tool wiring. The `test/stubs` + `--import ./test/register-stubs.js` pair stands in for the host-provided `@deepseek-ai/dsh-tools` and `@deepseek-ai/schemastery` packages; they must stay out of `node_modules` so an installed copy resolves the host's real packages.
+Tests cover the store, markdown round-trips, XML parsing, both registrar clients (mocked HTTP, no network), RDAP availability, registrar transfer confirmation/pricing/status/restart safety, and the plugin's tool wiring. The `test/stubs` + `--import ./test/register-stubs.js` pair stands in for the host-provided `@deepseek-ai/dsh-tools` and `@deepseek-ai/schemastery` packages; they must stay out of `node_modules` so an installed copy resolves the host's real packages.
 
 Load the checkout without installing it into a profile:
 

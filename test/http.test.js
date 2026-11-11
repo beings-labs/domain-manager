@@ -80,6 +80,20 @@ test('invalid JSON errors do not echo the response body', () => {
     assert.ok(!error.message.includes('secret-token'))
     return true
   })
+
+})
+
+test('redact covers transfer authorization codes and explicitly supplied sensitive values', async () => {
+  const sanitized = redact('auth_code=encoded-secret&eppCode=raw-secret {"authCode":"json-secret"}')
+  for (const secret of ['encoded-secret', 'raw-secret', 'json-secret']) assert.ok(!sanitized.includes(secret))
+  await assert.rejects(() => requestText('https://example.com/', {
+    sensitiveValues: ['raw-transfer-secret', 'encoded-transfer-secret'],
+    fetchImpl: async () => ({ status: 403, text: async () => 'raw-transfer-secret and encoded-transfer-secret' }),
+  }), (error) => {
+    assert.ok(!error.message.includes('raw-transfer-secret'))
+    assert.ok(!error.body.includes('encoded-transfer-secret'))
+    return true
+  })
 })
 
 test('invalid timeouts and missing fetch implementations fail explicitly', async () => {
