@@ -1,10 +1,10 @@
 {
   "name": "@beings-labs/dsh-domain-manager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Manage a domain portfolio in DeepSeek Harness: sync registrations from Namecheap and Cloudflare, track expiry dates, auto-renewal and yearly renewal costs, and check domain availability.",
+  "description": "Manage a domain portfolio in DeepSeek Harness: sync registrations from Namecheap and Cloudflare (API token or MCP browser login), track expiry dates, auto-renewal and yearly renewal costs, and check domain availability.",
   "license": "MIT",
   "author": {
     "name": "beingsone",
@@ -24,7 +24,9 @@
     "namecheap",
     "cloudflare",
     "registrar",
-    "availability"
+    "availability",
+    "cloudflare-mcp",
+    "mcp"
   ],
   "repository": {
     "type": "git",
@@ -44,10 +46,16 @@
     "dsh": ">=0.2.0 <0.3.0"
   },
   "peerDependencies": {
+    "@beings-labs/dsh-cloudflare-connector": "^0.1.1",
     "@deepseek-ai/cordis": "^4.0.4 || >=4.0.6-alpha.2 <5.0.0",
     "@deepseek-ai/dsh": ">=0.2.0 <0.3.0",
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 || >=0.2.1-rc.2 || >=0.2.2-rc.1",
     "@deepseek-ai/schemastery": "^3.18.2 || >=3.18.6-alpha.2 <4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@beings-labs/dsh-cloudflare-connector": {
+      "optional": true
+    }
   },
   "scripts": {
     "test": "node --import ./test/register-stubs.js --test test/*.test.js"

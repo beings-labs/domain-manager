@@ -17,10 +17,11 @@ import {
   summarize, updateDomain, upsertDomain, writeFileAtomic,
 } from './lib/store.js'
 import { parseDomainsMarkdown, renderDomainsMarkdown } from './lib/markdown.js'
-import { redact } from './lib/http.js'
+import { HttpError, redact } from './lib/http.js'
 import * as namecheap from './lib/registrars/namecheap.js'
 import * as cloudflare from './lib/registrars/cloudflare.js'
 import * as namecheapMcp from './lib/providers/mcp.js'
+import * as cloudflareConnector from './lib/providers/cloudflare-connector.js'
 import { checkAvailability, checkViaRdap } from './lib/availability.js'
 import { registerTransferTools, transferSchema, transferStateLabel } from './lib/transfers.js'
 
@@ -43,24 +44,25 @@ export const Config = Schema.object({
     apiToken: Schema.string(),
     accountId: Schema.string(),
     baseUrl: Schema.string(),
-  }).description('Cloudflare API token + account id. Env fallback: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.'),
+  }).description('Cloudflare API token + account id. Env fallback: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID. Optional in MCP mode (see providers.cloudflare): the connector resolves the account id when it is omitted.'),
   providers: Schema.object({
     namecheap: Schema.string().default('auto'),
     cloudflare: Schema.string().default('auto'),
   }).description(
-    'How each registrar is reached. Both default to "auto". Namecheap: "auto" (default; API credentials when configured, otherwise MCP), "api" (XML API credentials — the only mode that can read renewal, promo and ICANN prices for registered domains), or "mcp" (browser-login MCP connector; lists domains and checks availability but cannot read prices for registered domains). Cloudflare: "auto" (default; alias for api) or "api" (the plugin has no Cloudflare registrar MCP transport).',
+    'How each registrar is reached. Both default to "auto". Namecheap: "auto" (default; API credentials when configured, otherwise MCP), "api" (XML API credentials — the only mode that can read renewal, promo and ICANN prices for registered domains), or "mcp" (browser-login MCP connector; lists domains and checks availability but cannot read prices for registered domains). Cloudflare: "auto" (default; API credentials when configured, otherwise the Cloudflare MCP browser login; API failures never switch to OAuth), "api" (Registrar API with an API token), or "mcp" (@beings-labs/dsh-cloudflare-connector browser login — ignores the API token; requires Registrar OAuth consent, not just identity/account sign-in).',
   ),
 })
 
 const NAMECHEAP_MODES = ['api', 'mcp', 'auto']
-const CLOUDFLARE_MODES = ['api', 'auto']
+const CLOUDFLARE_MODES = ['api', 'mcp', 'auto']
 
 /**
  * Normalize the configured provider modes once, at startup.
  *
  * Both registrars default to `auto`: Namecheap prefers API credentials, then the
- * browser-login MCP connector. Cloudflare's `auto` is an alias for `api` because
- * the plugin has no Cloudflare registrar MCP transport.
+ * browser-login MCP connector. Cloudflare prefers API credentials, then the
+ * official Cloudflare MCP browser login (@beings-labs/dsh-cloudflare-connector), which reaches the
+ * same Registrar API without an API token.
  */
 function resolveProviderPreferences(providers = {}) {
   const mode = (registrar, raw, allowed) => {
@@ -68,7 +70,7 @@ function resolveProviderPreferences(providers = {}) {
     if (allowed.includes(value)) return value
     const error =
       registrar === 'cloudflare'
-        ? 'Cloudflare registrar access is API-only in this plugin: there is no Cloudflare registrar MCP transport, so providers.cloudflare must be "api" or "auto" (default).'
+        ? 'providers.cloudflare must be "api" (API token), "mcp" (@beings-labs/dsh-cloudflare-connector browser login) or "auto" (default; API credentials when configured, otherwise MCP).'
         : 'providers.namecheap must be "api", "mcp" (browser login) or "auto" (default; API credentials when configured, otherwise MCP).'
     throw new Error(`${error} Got "${value}".`)
   }
@@ -122,7 +124,18 @@ function text(value) {
 }
 
 function fail(error) {
-  throw new Error(redact(error?.message ?? String(error)))
+  const message = redact(error?.message ?? String(error))
+  if (error instanceof HttpError) {
+    throw new HttpError(message, {
+      status: error.status,
+      url: redact(error.url),
+      body: redact(error.body),
+      code: error.code,
+      scopes: error.scopes,
+      authorizationUrl: error.authorizationUrl,
+    })
+  }
+  throw new Error(message)
 }
 
 // --- schemas shared by tools ---------------------------------------------
@@ -346,7 +359,62 @@ export async function apply(ctx, config) {
   const dueWithinDays = config.dueWithinDays ?? 90
   const staleAfterDays = config.staleAfterDays ?? 14
   const providerPreferences = resolveProviderPreferences(config.providers ?? {})
-  registerTransferTools(ctx, { dataFile, withStore, cloudflareConfig: credentials.cloudflare })
+
+  /**
+   * Cloudflare is reachable two ways: the Registrar REST API with an API token, or
+   * the Cloudflare MCP browser login (@beings-labs/dsh-cloudflare-connector → mcp.cloudflare.com
+   * OAuth, no token). This object is shared by the registrar client and the
+   * transfer tools; the MCP transport is attached lazily because the connector may
+   * connect after this plugin starts, and it writes back the account id it
+   * discovers so persisted transfer quotes stay stable.
+   */
+  const cloudflareRuntime = {
+    apiToken: credentials.cloudflare.apiToken,
+    accountId: credentials.cloudflare.accountId,
+    baseUrl: credentials.cloudflare.baseUrl,
+  }
+  const cloudflareTransport = cloudflareConnector.createTransport(ctx, {
+    getAccountId: () => cloudflareRuntime.accountId,
+    onAccountId: (id) => { cloudflareRuntime.accountId = id },
+  })
+  // The transport is exposed through getters so every caller — the registrar
+  // client, availability checks and the transfer tools — sees the transport that
+  // is current right now, even when the MCP connector connects after startup.
+  Object.defineProperties(cloudflareRuntime, {
+    transport: {
+      enumerable: false,
+      get: () => (resolveCloudflareMode() === 'mcp' ? (request) => cloudflareTransport.request(request) : undefined),
+    },
+    discoverAccountId: {
+      enumerable: false,
+      get: () => (resolveCloudflareMode() === 'mcp' ? () => cloudflareTransport.resolveAccountId() : undefined),
+    },
+  })
+  registerTransferTools(ctx, { dataFile, withStore, cloudflareConfig: cloudflareRuntime })
+
+  /**
+   * Which transport reaches Cloudflare: api (API token), mcp (browser login via the
+   * Cloudflare MCP connector; the same Registrar API data, with account id
+   * discovery), or one of the missing-* states.
+   */
+  function resolveCloudflareMode() {
+    const mcpReady = cloudflareConnector.isAvailable(ctx)
+    const apiReady = Boolean(credentials.cloudflare.apiToken && credentials.cloudflare.accountId)
+    if (providerPreferences.cloudflare === 'mcp') return mcpReady ? 'mcp' : 'missing-mcp'
+    if (providerPreferences.cloudflare === 'api') return apiReady ? 'api' : 'missing-api'
+    // Auto: API credentials first, then the browser-login connector.
+    return apiReady ? 'api' : mcpReady ? 'mcp' : 'none'
+  }
+
+  function cloudflareModeError(mode) {
+    if (mode === 'missing-api') {
+      return 'Cloudflare API credentials are incomplete: set cloudflare.apiToken and cloudflare.accountId (or CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID). Alternatively add @beings-labs/dsh-cloudflare-connector (browser OAuth login, no API token) and leave providers.cloudflare on "auto".'
+    }
+    if (mode === 'missing-mcp') {
+      return `providers.cloudflare is "mcp" but the connector is missing. ${cloudflareConnector.missingServerMessage()}`
+    }
+    return 'Cloudflare is not configured: set cloudflare.apiToken and cloudflare.accountId for the Registrar API, or add @beings-labs/dsh-cloudflare-connector and authorize browser login (the default "auto" mode uses the MCP service when API credentials are absent).'
+  }
 
   /**
    * Which transport reaches Namecheap: api (API key — preferred in auto and the only
@@ -418,11 +486,29 @@ export async function apply(ctx, config) {
     )
   }
 
+  /**
+   * Fetch Cloudflare registrations in whichever transport is selected. Both
+   * transports read the same registrations API. It does not include renewal
+   * pricing, so sync preserves stored prices and reports the limitation.
+   */
+  async function fetchCloudflareDomains() {
+    const mode = resolveCloudflareMode()
+    if (mode === 'api' || mode === 'mcp') {
+      const rows = await cloudflare.listDomains(cloudflareRuntime)
+      return {
+        rows,
+        warnings: rows.length ? ['Cloudflare registrations do not include renewal pricing; kept stored prices where available, and new domain prices remain unknown.'] : [],
+      }
+    }
+    throw new Error(cloudflareModeError(mode))
+  }
+
   /** Availability providers in priority order: Cloudflare, then Namecheap in its configured transport, then public RDAP. */
   function availabilityProviders() {
     const list = []
-    if (cloudflare.isConfigured(credentials.cloudflare)) {
-      list.push({ name: 'cloudflare', run: (names) => cloudflare.checkAvailability(credentials.cloudflare, names) })
+    const cloudflareMode = resolveCloudflareMode()
+    if (cloudflareMode === 'api' || cloudflareMode === 'mcp') {
+      list.push({ name: 'cloudflare', run: (names) => cloudflare.checkAvailability(cloudflareRuntime, names) })
     }
     const mode = resolveNamecheapMode()
     if (mode === 'mcp') {
@@ -640,7 +726,7 @@ export async function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'domain_manager_sync',
     description:
-      'Sync registrations from a registrar into the local portfolio (keeps local purpose/group/notes) and refresh registrar facts. Use dryRun to preview. Both registrars default to auto: Namecheap prefers configured API credentials, otherwise uses MCP browser login. Namecheap API mode also refreshes renewal, promo and ICANN-fee prices, while MCP mode lists domains only and cannot read prices for registered domains. Cloudflare is API-only.',
+      'Sync registrations from a registrar into the local portfolio (keeps local purpose/group/notes) and refresh registrar facts. Use dryRun to preview. Both registrars default to auto: Namecheap prefers configured API credentials, otherwise uses MCP browser login. Namecheap API mode also refreshes renewal, promo and ICANN-fee prices, while MCP mode lists domains only and cannot read prices for registered domains. Cloudflare uses the API token when configured, otherwise the @beings-labs/dsh-cloudflare-connector browser login. Both Cloudflare modes preserve stored prices because the registrations list has no renewal pricing.',
     parameters: {
       registrar: { type: 'string', required: true, description: 'namecheap, cloudflare, or all.' },
       dryRun: { type: 'boolean', description: 'Report changes without saving.' },
@@ -684,7 +770,9 @@ export async function apply(ctx, config) {
             rows = result.rows
             fetchWarnings.push(...result.warnings)
           } else {
-            rows = await cloudflare.listDomains(credentials.cloudflare)
+            const result = await fetchCloudflareDomains()
+            rows = result.rows
+            fetchWarnings.push(...result.warnings)
           }
           fetchedCount.set(provider, rows.length)
           fetched.push(...rows)
@@ -775,10 +863,10 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'domain_manager_check_availability',
-    description: 'Check whether domains are available to register (1-20 names). Uses the configured Cloudflare or Namecheap API when available for pricing, otherwise public RDAP.',
+    description: 'Check whether domains are available to register (1-20 names). Uses Cloudflare (API token or @beings-labs/dsh-cloudflare-connector browser login), then Namecheap, for registry pricing when available, otherwise public RDAP.',
     parameters: {
       domains: { type: 'string', required: true, description: 'Comma- or space-separated domain names.' },
-      provider: { type: 'string', description: 'auto (default), cloudflare, namecheap, mcp (Namecheap browser login; requires providers.namecheap "mcp" or "auto"), or rdap.' },
+      provider: { type: 'string', description: 'auto (default), cloudflare (API token or MCP browser login, whichever is configured), namecheap, mcp (Namecheap browser login; requires providers.namecheap "mcp" or "auto"), or rdap.' },
     },
     output: {
       schema: {
@@ -821,6 +909,7 @@ export async function apply(ctx, config) {
           if (!wanted) throw new Error(`provider must be auto, mcp, cloudflare, namecheap, or rdap (got ${explicit})`)
           providers = providers.filter((provider) => provider.name === wanted)
           if (providers.length === 0) {
+            if (explicit === 'cloudflare') throw new Error(cloudflareModeError(resolveCloudflareMode()))
             const mcpConnected = namecheapMcp.isAvailable(typeof ctx.tools?.schemas === 'function' ? ctx.tools.schemas() : [])
             throw new Error(
               explicit === 'mcp'
@@ -855,7 +944,7 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'domain_manager_search',
-    description: 'Search for domain name candidates by keyword using the Cloudflare Registrar search API (requires Cloudflare credentials). Results are for discovery only — confirm with domain_manager_check_availability before acting.',
+    description: 'Search for domain name candidates by keyword using the Cloudflare Registrar search API (requires the Cloudflare API token or the @beings-labs/dsh-cloudflare-connector browser login). Results are for discovery only — confirm with domain_manager_check_availability before acting.',
     parameters: {
       query: { type: 'string', required: true, description: 'Keyword or phrase, e.g. "coffee shop".' },
       limit: { type: 'number', description: 'Number of candidates, 1-20 (default 5).' },
@@ -895,7 +984,9 @@ export async function apply(ctx, config) {
     },
     async execute(args) {
       try {
-        const rows = await cloudflare.searchDomains(credentials.cloudflare, args.query, { limit: args.limit ?? 5 })
+        const mode = resolveCloudflareMode()
+        if (mode !== 'api' && mode !== 'mcp') throw new Error(cloudflareModeError(mode))
+        const rows = await cloudflare.searchDomains(cloudflareRuntime, args.query, { limit: args.limit ?? 5 })
         return {
           query: args.query,
           results: rows.map((row) => {
@@ -1016,7 +1107,10 @@ export async function apply(ctx, config) {
   }))
 
   const namecheapModeNote = providerPreferences.namecheap === 'mcp' ? ' (MCP cannot read registered-domain prices)' : ''
+  const cloudflareMode = resolveCloudflareMode()
+  const cloudflareTransportNote =
+    cloudflareMode === 'mcp' ? ' (MCP browser login)' : cloudflareMode === 'api' ? ' (API token)' : ' (not connected)'
   ctx.logger?.info?.(
-    `dsh-domain-manager ready (store: ${dataFile}; namecheap: ${providerPreferences.namecheap} mode${namecheapModeNote}, API ${namecheap.isConfigured(credentials.namecheap) ? 'configured' : 'not configured'}; cloudflare: ${providerPreferences.cloudflare} mode (API-only), API ${cloudflare.isConfigured(credentials.cloudflare) ? 'configured' : 'not configured'})`,
+    `dsh-domain-manager ready (store: ${dataFile}; namecheap: ${providerPreferences.namecheap} mode${namecheapModeNote}, API ${namecheap.isConfigured(credentials.namecheap) ? 'configured' : 'not configured'}; cloudflare: ${providerPreferences.cloudflare} mode${cloudflareTransportNote}, API ${cloudflare.isConfigured(credentials.cloudflare) ? 'configured' : 'not configured'})`,
   )
 }

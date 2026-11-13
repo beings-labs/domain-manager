@@ -94,18 +94,16 @@ const CF_LIST = {
   success: true,
   result: [
     {
-      name: 'example.com', expires_at: '2027-03-15T12:00:00.000Z', auto_renew: true,
-      premium_type: 'not_premium', fees: { renewal_fee: 9.15, currency: 'USD' },
+      domain_name: 'example.com', expires_at: '2027-03-15T12:00:00.000Z', auto_renew: true, status: 'active',
     },
     {
-      name: 'example.dev', expires_at: '2028-02-28T00:00:00.000Z', auto_renew: false,
-      premium_type: 'standard_premium', fees: { renewal_fee: 40, currency: 'USD' },
+      domain_name: 'example.dev', expires_at: '2028-02-28T00:00:00.000Z', auto_renew: false, status: 'active',
     },
   ],
-  result_info: { page: 0, per_page: 100, total_pages: 1 },
+  result_info: { count: 2, per_page: 50, cursor: '' },
 }
 
-test('cloudflare lists registrations with fees', async () => {
+test('cloudflare lists current registrations without fabricating prices or premium flags', async () => {
   const calls = []
   const fetchImpl = async (url, init) => {
     calls.push({ url, init })
@@ -114,19 +112,25 @@ test('cloudflare lists registrations with fees', async () => {
   const domains = await cloudflare.listDomains({ apiToken: 't', accountId: 'acct' }, { fetchImpl })
   assert.equal(domains.length, 2)
   assert.equal(domains[0].expires, '2027-03-15')
-  assert.equal(domains[0].renewalPrice, 9.15)
-  assert.equal(domains[1].premium, true)
-  assert.match(calls[0].url, /accounts\/acct\/registrar\/domains\?per_page=100&page=0/)
+  assert.equal(Object.hasOwn(domains[0], 'renewalPrice'), false)
+  assert.equal(Object.hasOwn(domains[1], 'premium'), false)
+  assert.match(calls[0].url, /accounts\/acct\/registrar\/registrations\?per_page=50$/)
   assert.equal(calls[0].init.headers.Authorization, 'Bearer t')
 })
 
-test('cloudflare paginates through result_info', async () => {
+test('cloudflare follows opaque registration cursors without using page numbers', async () => {
   const pages = [
-    { success: true, result: [CF_LIST.result[0]], result_info: { total_pages: 2 } },
-    { success: true, result: [CF_LIST.result[1]], result_info: { total_pages: 2 } },
+    { success: true, result: [CF_LIST.result[0]], result_info: { cursor: 'opaque +/next' } },
+    { success: true, result: [CF_LIST.result[1]], result_info: { cursor: '' } },
   ]
   let index = 0
-  const fetchImpl = async () => response(JSON.stringify(pages[index++]))
+  const fetchImpl = async (url) => {
+    const query = new URL(url).searchParams
+    assert.equal(query.get('per_page'), '50')
+    assert.equal(query.has('page'), false)
+    assert.equal(query.get('cursor'), index === 0 ? null : 'opaque +/next')
+    return response(JSON.stringify(pages[index++]))
+  }
   const domains = await cloudflare.listDomains({ apiToken: 't', accountId: 'acct' }, { fetchImpl })
   assert.equal(domains.length, 2)
   assert.equal(index, 2)
@@ -137,7 +141,13 @@ test('cloudflare reports API errors from the envelope', async () => {
     response(JSON.stringify({ success: false, errors: [{ code: 10000, message: 'Authentication error' }] }))
   await assert.rejects(
     () => cloudflare.listDomains({ apiToken: 'bad', accountId: 'acct' }, { fetchImpl }),
-    /Authentication error/,
+    (error) => {
+      assert.match(error.message, /10000 Authentication error/)
+      assert.match(error.message, /Fix cloudflare.apiToken/)
+      assert.match(error.message, /restart the app/)
+      assert.match(error.message, /does not switch to OAuth after a failure/)
+      return true
+    },
   )
 })
 
@@ -301,14 +311,17 @@ test('Namecheap availability surfaces per-domain errors instead of marking the d
   ), /availability failed.*2011169/)
 })
 
-test('Cloudflare rejects missing success envelopes, malformed lists and invalid page counts', async () => {
+test('Cloudflare rejects missing success envelopes, malformed registrations and invalid cursors', async () => {
   const config = { apiToken: 't', accountId: 'acct' }
   for (const payload of [
     { result: [] },
     { success: true },
-    { ...CF_LIST, result_info: { total_pages: 'invalid' } },
-    { ...CF_LIST, result_info: { total_pages: Infinity } },
+    { ...CF_LIST, result_info: {} },
+    { ...CF_LIST, result_info: { cursor: 123 } },
+    { ...CF_LIST, result_info: { cursor: 'a'.repeat(257) } },
     { ...CF_LIST, result: [{ ...CF_LIST.result[0], auto_renew: 'false' }] },
+    { ...CF_LIST, result: [{ ...CF_LIST.result[0], expires_at: null, status: 'transfer_pending' }] },
+    { ...CF_LIST, result: [null] },
   ]) {
     await assert.rejects(() => cloudflare.listDomains(config, {
       fetchImpl: async () => response(JSON.stringify(payload)),
@@ -318,9 +331,24 @@ test('Cloudflare rejects missing success envelopes, malformed lists and invalid 
 
 test('Cloudflare valid empty portfolios remain supported', async () => {
   const domains = await cloudflare.listDomains({ apiToken: 't', accountId: 'acct' }, {
-    fetchImpl: async () => response('{"success":true,"result":[],"result_info":{"total_pages":0}}'),
+    fetchImpl: async () => response('{"success":true,"result":[],"result_info":{"cursor":""}}'),
   })
   assert.deepEqual(domains, [])
+})
+
+test('Cloudflare rejects repeated cursors and enforces the registrations page-size limit', async () => {
+  const config = { apiToken: 't', accountId: 'acct' }
+  for (const perPage of [0, 51, 1.5]) {
+    await assert.rejects(cloudflare.listDomains(config, { perPage }), /between 1 and 50/)
+  }
+  let calls = 0
+  await assert.rejects(cloudflare.listDomains(config, {
+    fetchImpl: async () => {
+      calls++
+      return response(JSON.stringify({ ...CF_LIST, result_info: { cursor: 'repeat' } }))
+    },
+  }), /repeated.*cursor/)
+  assert.equal(calls, 2)
 })
 
 test('Cloudflare availability does not coerce string false into true', async () => {

@@ -7,13 +7,29 @@ import { apply } from '../index.js'
 import { loadData } from '../lib/store.js'
 import { explainReasons } from '../lib/transfers.js'
 import * as cloudflare from '../lib/registrars/cloudflare.js'
+import { fakeCloudflareConnector } from './support/cloudflare-connector.js'
+
+/** Run with no ambient Cloudflare credentials, so MCP account discovery is exercised. */
+async function withoutCloudflareEnv(fn) {
+  const keys = ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID']
+  const saved = new Map(keys.map((key) => [key, process.env[key]]))
+  for (const key of keys) delete process.env[key]
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
 
 const CONFIG = { apiToken: 'transfer-test-token', accountId: 'acct' }
 const AUTH = 'epp<&"secret+/= code'
 const ENCODED = Buffer.from(AUTH, 'utf8').toString('base64')
 
 function response(result, status = 200) {
-  return { status, text: async () => JSON.stringify({ success: true, errors: [], result }) }
+  return { status, text: async () => JSON.stringify({ success: true, errors: [], result, ...(Array.isArray(result) ? { result_info: { cursor: '' } } : {}) }) }
 }
 
 function eligibility(overrides = {}, name = 'example.com') {
@@ -405,8 +421,7 @@ test('stale losing-registrar rows cannot revert a completed transfer during sync
       text: async () => '<ApiResponse Status="OK"><CommandResponse><UserGetPricingResult><ProductCategory Name="renew"><Product Name="com"><Price Duration="1" DurationType="YEAR" Price="18" RegularPrice="18" AdditionalCost="0.2"/></Product></ProductCategory></UserGetPricingResult></CommandResponse></ApiResponse>',
     }
     return response([{
-      name: 'example.com', expires_at: '2028-03-15T12:00:00Z', auto_renew: true,
-      fees: { renewal_fee: 11.25, currency: 'USD' },
+      domain_name: 'example.com', expires_at: '2028-03-15T12:00:00Z', auto_renew: true, status: 'active',
     }])
   })
   const checked = await h.run('check', { authCode: AUTH })
@@ -419,11 +434,11 @@ test('stale losing-registrar rows cannot revert a completed transfer during sync
   assert.ok(synced.warnings.some((warning) => /ignored Namecheap/.test(warning)))
   assert.equal((await h.stored()).registrar, 'Cloudflare')
   assert.equal((await h.stored()).transfer.state, 'succeeded')
-  assert.equal((await h.stored()).renewalPrice, 11.25)
+  assert.equal((await h.stored()).renewalPrice, 10.11)
   assert.equal((await h.stored()).icannFee, null)
   assert.equal((await h.stored()).promoPrice, null)
   await h.run('status', {})
-  assert.equal((await h.stored()).renewalPrice, 11.25)
+  assert.equal((await h.stored()).renewalPrice, 10.11)
 })
 
 test('registrar sync preserves active transfers and does not prematurely move the portfolio', async (t) => {
@@ -432,8 +447,7 @@ test('registrar sync preserves active transfers and does not prematurely move th
     if (String(url).endsWith('/domain-transfer-check')) return response(eligibility())
     if (String(url).endsWith('/transfer-in')) return response(workflow(), 202)
     return response([{
-      name: 'example.com', expires_at: '2028-03-15T12:00:00Z', auto_renew: true,
-      fees: { renewal_fee: 10.11, currency: 'USD' },
+      domain_name: 'example.com', expires_at: '2028-03-15T12:00:00Z', auto_renew: true, status: 'active',
     }])
   })
   const checked = await h.run('check', { authCode: AUTH })
@@ -752,3 +766,81 @@ test('zero-fee transfer confirmation mentions a possible extension without claim
   assert.match(checked.confirmationPrompt, /Do you explicitly confirm transferring/)
   assert.doesNotMatch(checked.confirmationPrompt, /may bill for/)
 })
+
+test('transfers run through the Cloudflare MCP transport and keep the account id in the quote', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-domain-transfer-mcp-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const file = join(dir, 'domains.json')
+  const { ctx, calls, requests } = fakeCloudflareConnector({
+    routes: {
+      'POST /accounts/acctMCP/registrar/domain-transfer-check': { body: { success: true, errors: [], result: eligibility() } },
+      'GET /zones': { body: { success: true, errors: [], result: [{ name: 'example.com', status: 'active', account: { id: 'acctMCP' }, name_servers: ['kate.ns.cloudflare.com'] }] } },
+    },
+  })
+  const tools = new Map()
+  const register = ctx.tools.register
+  ctx.tools.register = (tool) => {
+    register(tool)
+    tools.set(tool.name, tool)
+  }
+  await apply(ctx, { dataFile: file, cloudflare: { accountId: 'acctMCP' }, providers: { cloudflare: 'mcp' } })
+  await tools.get('domain_manager_add').execute({ name: 'example.com', registrar: 'Namecheap', expires: '2027-03-15', autoRenew: true })
+
+  const checked = await tools.get('domain_manager_transfer_check').execute({ name: 'example.com', authCode: AUTH, autoRenew: false })
+  assert.equal(checked.transfer.state, 'ready')
+  assert.equal(checked.transfer.accountId, 'acctMCP')
+  assert.equal(checked.transfer.transferPrice, 9.99)
+  assert.equal(checked.transfer.renewalPrice, 10.11)
+  assert.equal(checked.transfer.warnings, undefined, 'an active zone produces no readiness warning')
+
+  // The same documented request shapes travel through the MCP sandbox.
+  const checkRequest = requests.find((request) => request.path.endsWith('/domain-transfer-check'))
+  assert.deepEqual(checkRequest.body, { domains: [{ domain_name: 'example.com', auth_code: ENCODED }] })
+  const serviceCall = calls.find((call) => call.request.path.endsWith('/domain-transfer-check'))
+  assert.equal(serviceCall.options.accountId, 'acctMCP')
+  assert.ok(serviceCall.options.sensitiveValues.includes(ENCODED))
+  assert.ok(!JSON.stringify(checked).includes(AUTH), 'the EPP code never reaches the stored quote')
+})
+
+test('a restarted MCP session resolves the discovered account id before comparing transfer ownership', async (t) => withoutCloudflareEnv(async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-domain-transfer-mcp-restart-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const file = join(dir, 'domains.json')
+
+  const build = () => {
+    const fake = fakeCloudflareConnector({
+      routes: {
+        'GET /accounts': { body: { success: true, result: [{ id: 'acctMCP' }] } },
+        'POST /accounts/acctMCP/registrar/domain-transfer-check': { body: { success: true, errors: [], result: eligibility() } },
+        'GET /zones': { body: { success: true, errors: [], result: [{ name: 'example.com', status: 'active', account: { id: 'acctMCP' }, name_servers: [] }] } },
+        'GET /accounts/acctMCP/registrar/registrations/example.com/transfer-in-status': {
+          body: { success: true, errors: [], result: workflow('pending') },
+        },
+      },
+    })
+    const tools = new Map()
+    const register = fake.ctx.tools.register
+    fake.ctx.tools.register = (tool) => {
+      register(tool)
+      tools.set(tool.name, tool)
+    }
+    return { fake, tools }
+  }
+
+  const first = build()
+  await apply(first.fake.ctx, { dataFile: file, cloudflare: {}, providers: { cloudflare: 'mcp' } })
+  await first.tools.get('domain_manager_add').execute({ name: 'example.com', registrar: 'Namecheap', expires: '2027-03-15', autoRenew: true })
+  const checked = await first.tools.get('domain_manager_transfer_check').execute({ name: 'example.com', authCode: AUTH, autoRenew: false })
+  assert.equal(checked.transfer.accountId, 'acctMCP', 'the quote stores the account id discovered through MCP')
+
+  // Simulate a restart: the transfer is in flight and the runtime no longer has an account id.
+  const data = JSON.parse(await readFile(file, 'utf8'))
+  data.domains[0].transfer.state = 'pending'
+  data.domains[0].transfer.updatedAt = new Date().toISOString()
+  await writeFile(file, JSON.stringify(data), 'utf8')
+
+  const second = build()
+  await apply(second.fake.ctx, { dataFile: file, cloudflare: {}, providers: { cloudflare: 'mcp' } })
+  const status = await second.tools.get('domain_manager_transfer_status').execute({ name: 'example.com' })
+  assert.equal(status.transfer.state, 'pending')
+}))

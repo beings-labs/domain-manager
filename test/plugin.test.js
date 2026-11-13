@@ -10,11 +10,10 @@ const CF_PAGE = {
   success: true,
   result: [
     {
-      name: 'example.com', expires_at: '2027-03-15T12:00:00.000Z', auto_renew: true,
-      premium_type: 'not_premium', fees: { renewal_fee: 9.15, currency: 'USD' },
+      domain_name: 'example.com', expires_at: '2027-03-15T12:00:00.000Z', auto_renew: true, status: 'active',
     },
   ],
-  result_info: { page: 1, per_page: 100, total_pages: 1 },
+  result_info: { cursor: '' },
 }
 
 async function harness(overrides = {}) {
@@ -129,11 +128,11 @@ test('domain_manager_sync imports Cloudflare registrations and keeps local curat
     const domain = data.domains[0]
     assert.equal(domain.expires, '2027-03-15')
     assert.equal(domain.autoRenew, true)
-    assert.equal(domain.renewalPrice, 9.15)
+    assert.equal(domain.renewalPrice, 1, 'registration listing preserves the stored price')
     assert.equal(domain.purpose, 'kept locally')
     assert.equal(domain.group, 'demo')
     assert.equal(domain.source, 'cloudflare')
-    assert.match(urls[0], /api\.cloudflare\.com\/client\/v4\/accounts\/acct\/registrar\/domains/)
+    assert.match(urls[0], /api\.cloudflare\.com\/client\/v4\/accounts\/acct\/registrar\/registrations/)
   } finally {
     globalThis.fetch = previousFetch
   }
@@ -141,7 +140,7 @@ test('domain_manager_sync imports Cloudflare registrations and keeps local curat
 
 test('domain_manager_sync without credentials explains how to configure it', async () => {
   const { tools } = await harness()
-  await assert.rejects(() => tools.get('domain_manager_sync').execute({ registrar: 'cloudflare' }), /Cloudflare API is not configured/)
+  await assert.rejects(() => tools.get('domain_manager_sync').execute({ registrar: 'cloudflare' }), /Cloudflare is not configured/)
   await assert.rejects(() => tools.get('domain_manager_sync').execute({ registrar: 'namecheap' }), /Namecheap is not configured/)
   await assert.rejects(() => tools.get('domain_manager_sync').execute({ registrar: 'godaddy' }), /registrar must be/)
 })
@@ -189,7 +188,7 @@ test('availability prefers Cloudflare pricing when configured', async () => {
 
 test('domain_manager_search requires Cloudflare credentials', async () => {
   const { tools } = await harness()
-  await assert.rejects(() => tools.get('domain_manager_search').execute({ query: 'acme' }), /Cloudflare API is not configured/)
+  await assert.rejects(() => tools.get('domain_manager_search').execute({ query: 'acme' }), /Cloudflare is not configured/)
 })
 
 test('report warns when synced data is stale, and stays quiet for manual domains', async () => {
